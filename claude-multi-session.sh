@@ -3,9 +3,22 @@
 # Spawns and manages parallel Claude Code sessions automatically
 #
 # https://github.com/illforte/claude-multi-session
-# Version: 1.1.0
+# Version: 1.2.1
 #
 # CHANGELOG:
+# v1.2.1 (2026-01-03)
+#   - Enhanced prompts with automatic validation and verification wrappers
+#   - Pre-task analysis phase to identify errors and edge cases before execution
+#   - Post-task 2-iteration verification with confidence reporting
+#   - Configurable prompt enhancement via CLAUDE_ENHANCE_PROMPTS env var
+#   - Improved error prevention and self-verification in automated tasks
+#
+# v1.2.0 (2026-01-03)
+#   - Added automatic sprint history tracking
+#   - Sprints recorded to .claude/sprint-history.json
+#   - Added record-sprint command for manual recording
+#   - Cost and duration aggregation for historical analysis
+#
 # v1.1.0 (2026-01-03)
 #   - Added signal handling (SIGINT/SIGTERM) for graceful cleanup
 #   - Added task field validation (id, prompt required)
@@ -30,12 +43,47 @@
 set -euo pipefail
 shopt -s nullglob  # Handle empty globs gracefully
 
-VERSION="1.1.0"
+VERSION="1.2.1"
+
+# PROJECT_DIR must be defined early (used by SPRINT_TRACKER)
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+
+# Sprint tracker location
+SPRINT_TRACKER="${PROJECT_DIR}/scripts/lib/sprint-tracker.mjs"
+
+# Prompt enhancement (validation + verification wrapper)
+ENABLE_PROMPT_ENHANCEMENT="${CLAUDE_ENHANCE_PROMPTS:-true}"
+
+# Pre-task validation prompt
+VALIDATION_PREFIX='**BEFORE STARTING:** Analyze this task for 30 seconds:
+1. Identify potential errors or edge cases in the approach
+2. Check for missing implementation gaps
+3. Consider improvements to make the task more robust
+4. If you find issues, document them and proceed with the enhanced approach.
+
+**TASK:**
+'
+
+# Post-task verification prompt
+VERIFICATION_SUFFIX='
+
+**AFTER COMPLETING:** Perform 2 verification iterations:
+1. **First pass:** Review all changes for errors, type issues, missing imports, broken references
+2. **Second pass:** Check for edge cases, incomplete implementations, or gaps in the solution
+3. **Report format:** End your response with:
+   ```
+   ## Verification Report
+   - Errors found: [list or "None"]
+   - Gaps identified: [list or "None"]
+   - Improvements made: [list]
+   - Confidence: [High/Medium/Low]
+   ```
+'
 
 # Configuration (can be overridden via environment variables)
+# PROJECT_DIR already defined above (needed early for SPRINT_TRACKER)
 SESSIONS_DIR="${CLAUDE_SESSIONS_DIR:-/tmp/claude-sessions}"
 LOG_FILE="${CLAUDE_SESSIONS_LOG:-$SESSIONS_DIR/orchestrator.log}"
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(pwd)}"
 DEFAULT_TIMEOUT="${CLAUDE_SESSION_TIMEOUT:-600}"  # 10 minutes max per session
 MAX_RETRIES="${CLAUDE_MAX_RETRIES:-2}"
 DEFAULT_MODEL="${CLAUDE_DEFAULT_MODEL:-sonnet}"
@@ -161,6 +209,20 @@ require_arg() {
     fi
 }
 
+# Enhance prompt with validation and verification wrappers
+enhance_prompt() {
+    local prompt="$1"
+    local skip_enhance="${2:-false}"
+
+    if [[ "$ENABLE_PROMPT_ENHANCEMENT" != "true" ]] || [[ "$skip_enhance" == "true" ]]; then
+        echo "$prompt"
+        return
+    fi
+
+    # Combine: validation prefix + original prompt + verification suffix
+    echo "${VALIDATION_PREFIX}${prompt}${VERIFICATION_SUFFIX}"
+}
+
 usage() {
     cat << EOF
 Claude Multi-Session Orchestrator v${VERSION}
@@ -187,6 +249,14 @@ Options (via environment variables):
   CLAUDE_DEFAULT_MODEL    Default model (default: sonnet)
   CLAUDE_DEFAULT_BUDGET   Default budget in USD (default: 5)
   CLAUDE_MAX_PARALLEL     Max parallel sessions (default: 4)
+  CLAUDE_ENHANCE_PROMPTS  Enable validation+verification wrappers (default: true)
+
+Prompt Enhancement (enabled by default):
+  Each task automatically receives:
+  - PRE-TASK:  Validation phase to identify errors/gaps before starting
+  - POST-TASK: 2-iteration verification to check for errors/gaps after completion
+
+  Disable with: CLAUDE_ENHANCE_PROMPTS=false
 
 Examples:
   # Start a single session
@@ -211,6 +281,107 @@ Examples:
 
 For more information, see: https://github.com/illforte/claude-multi-session
 EOF
+}
+
+# Record sprint to history
+record_sprint() {
+    local tasks_json="$1"
+    local goal="${2:-Multi-session sprint}"
+    local total_cost="$3"
+    local total_duration="$4"
+    local commit_hash="${5:-}"
+    local commit_msg="${6:-}"
+
+    # Check if tracker exists
+    if [[ ! -f "$SPRINT_TRACKER" ]]; then
+        log "WARN" "Sprint tracker not found at $SPRINT_TRACKER - skipping history recording"
+        return 0
+    fi
+
+    # Build sprint JSON
+    local sprint_id
+    sprint_id="sprint-$(date +%Y-%m-%d)-$(date +%H%M)"
+
+    local tasks_array="["
+    local first=true
+
+    for output_file in "$SESSIONS_DIR"/*.output; do
+        [[ ! -f "$output_file" ]] && continue
+
+        local task_id
+        task_id=$(basename "$output_file" .output)
+        local status_file="$SESSIONS_DIR/${task_id}.status"
+        local status="unknown"
+        [[ -f "$status_file" ]] && status=$(cat "$status_file")
+
+        # Parse output JSON for cost/duration
+        local cost=0
+        local duration=0
+        local result="No result"
+
+        if jq -e . "$output_file" > /dev/null 2>&1; then
+            cost=$(jq -r '.total_cost_usd // 0' "$output_file")
+            duration=$(jq -r '.duration_ms // 0' "$output_file")
+            duration=$((duration / 1000))  # Convert to seconds
+            result=$(jq -r '.result // "No result"' "$output_file" | head -c 200)
+        fi
+
+        # Get task title from original tasks JSON
+        local title
+        title=$(echo "$tasks_json" | jq -r --arg id "$task_id" '.[] | select(.id == $id) | .prompt' | head -c 50)
+        [[ -z "$title" ]] && title="$task_id"
+
+        [[ "$first" == "false" ]] && tasks_array+=","
+        first=false
+
+        tasks_array+=$(cat <<TASK
+{
+  "id": "$task_id",
+  "title": "${title//\"/\\\"}",
+  "status": "$(echo "$status" | sed 's/failed:.*/failed/')",
+  "result": "${result//\"/\\\"}",
+  "duration_seconds": $duration,
+  "cost_usd": $cost
+}
+TASK
+)
+    done
+
+    tasks_array+="]"
+
+    # Get files changed since sprint started
+    local files_changed
+    files_changed=$(git status --short 2>/dev/null | awk '{print $2}' | jq -R -s 'split("\n") | map(select(length > 0))')
+
+    # Build full sprint JSON
+    local sprint_json
+    sprint_json=$(cat <<SPRINT
+{
+  "id": "$sprint_id",
+  "date": "$(date -Iseconds)",
+  "goal": "${goal//\"/\\\"}",
+  "mode": "auto",
+  "sessions": $(echo "$tasks_json" | jq 'length'),
+  "tasks": $tasks_array,
+  "totals": {
+    "tasks_completed": $(echo "$tasks_json" | jq 'length'),
+    "tasks_failed": 0,
+    "duration_seconds": $total_duration,
+    "cost_usd": $total_cost
+  },
+  "files_changed": $files_changed,
+  "commit": {
+    "hash": "$commit_hash",
+    "message": "${commit_msg//\"/\\\"}"
+  }
+}
+SPRINT
+)
+
+    # Record via tracker
+    echo "$sprint_json" | node "$SPRINT_TRACKER" add
+
+    log "INFO" "Recorded sprint $sprint_id to history"
 }
 
 # Run multiple tasks and wait for completion
@@ -244,20 +415,32 @@ run_multi() {
     echo -e "${BLUE}Model: $model | Budget: \$$budget | Timeout: ${DEFAULT_TIMEOUT}s${NC}"
     echo ""
 
+    # Check if enhancement is enabled
+    if [[ "$ENABLE_PROMPT_ENHANCEMENT" == "true" ]]; then
+        echo -e "${CYAN}Prompt enhancement: ENABLED (validation + verification)${NC}"
+    else
+        echo -e "${YELLOW}Prompt enhancement: DISABLED${NC}"
+    fi
+    echo ""
+
     # Parse and start tasks
     local started=0
     while IFS= read -r task; do
         local task_id
         local prompt
+        local enhanced_prompt
         task_id=$(echo "$task" | jq -r '.id')
         prompt=$(echo "$task" | jq -r '.prompt')
+
+        # Enhance prompt with validation/verification wrappers
+        enhanced_prompt=$(enhance_prompt "$prompt")
 
         if [[ $started -ge $max_parallel ]]; then
             echo -e "${YELLOW}Reached max parallel ($max_parallel), waiting for slots...${NC}"
             wait_for_slot "$max_parallel"
         fi
 
-        start_session "$task_id" "$prompt" "$model" "$budget"
+        start_session "$task_id" "$enhanced_prompt" "$model" "$budget"
         inc started
     done < <(echo "$tasks_json" | jq -c '.[]')
 
@@ -302,6 +485,11 @@ run_multi() {
     echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
 
     log "INFO" "Multi-session complete: $task_count tasks, total_cost=\$$total_cost, total_duration=${total_duration}s"
+
+    # Auto-record sprint to history
+    echo ""
+    echo -e "${CYAN}Recording sprint to history...${NC}"
+    record_sprint "$tasks_json" "Multi-session sprint ($task_count tasks)" "$total_cost" "$total_duration"
 }
 
 # Wait for a slot to become available
