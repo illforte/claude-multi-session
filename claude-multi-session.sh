@@ -3,7 +3,25 @@
 # Spawns and manages parallel Claude Code sessions automatically
 #
 # https://github.com/illforte/claude-multi-session
-# Version: 1.0.0
+# Version: 1.1.0
+#
+# CHANGELOG:
+# v1.1.0 (2026-01-03)
+#   - Added signal handling (SIGINT/SIGTERM) for graceful cleanup
+#   - Added task field validation (id, prompt required)
+#   - Added argument validation for result/output/stop commands
+#   - Added list command to show task IDs
+#   - Added stale session detection in clean command
+#   - Fixed prompt display to only show ... if truncated
+#   - Fixed integer division rounding for duration
+#   - Improved output success detection
+#
+# v1.0.0 (2026-01-02)
+#   - Initial release with run-multi, start, status, result, stop commands
+#   - Cross-platform date parsing (macOS + Linux)
+#   - Session timeout with auto-kill
+#   - Cost aggregation across sessions
+#   - Live dashboard with progress tracking
 #
 # SECURITY NOTE: Sessions run with --permission-mode bypassPermissions
 # This is intentional for automation but means sessions can modify files
@@ -12,7 +30,7 @@
 set -euo pipefail
 shopt -s nullglob  # Handle empty globs gracefully
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # Configuration (can be overridden via environment variables)
 SESSIONS_DIR="${CLAUDE_SESSIONS_DIR:-/tmp/claude-sessions}"
@@ -23,6 +41,7 @@ MAX_RETRIES="${CLAUDE_MAX_RETRIES:-2}"
 DEFAULT_MODEL="${CLAUDE_DEFAULT_MODEL:-sonnet}"
 DEFAULT_BUDGET="${CLAUDE_DEFAULT_BUDGET:-5}"
 DEFAULT_MAX_PARALLEL="${CLAUDE_MAX_PARALLEL:-4}"
+STALE_THRESHOLD="${CLAUDE_STALE_THRESHOLD:-60}"  # Seconds to consider a stopped session stale
 
 # Colors
 RED='\033[0;31m'
@@ -34,6 +53,15 @@ NC='\033[0m'
 
 # Create sessions directory
 mkdir -p "$SESSIONS_DIR"
+
+# Signal handling for graceful cleanup
+cleanup_on_exit() {
+    echo ""
+    echo -e "${YELLOW}Received interrupt signal. Stopping all sessions...${NC}"
+    stop_all
+    exit 130
+}
+trap cleanup_on_exit SIGINT SIGTERM
 
 # Check dependencies
 check_dependencies() {
@@ -100,6 +128,39 @@ validate_json() {
     return 0
 }
 
+# Validate task array has required fields
+validate_tasks() {
+    local json="$1"
+    local task_count
+    task_count=$(echo "$json" | jq 'length')
+
+    for i in $(seq 0 $((task_count - 1))); do
+        local task_id prompt
+        task_id=$(echo "$json" | jq -r ".[$i].id // empty")
+        prompt=$(echo "$json" | jq -r ".[$i].prompt // empty")
+
+        if [[ -z "$task_id" ]]; then
+            echo -e "${RED}Task $i missing 'id' field${NC}"
+            return 1
+        fi
+        if [[ -z "$prompt" ]]; then
+            echo -e "${RED}Task '$task_id' missing 'prompt' field${NC}"
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Require argument helper
+require_arg() {
+    local arg="${1:-}"
+    local name="$2"
+    if [[ -z "$arg" ]]; then
+        echo -e "${RED}Missing required argument: $name${NC}"
+        exit 1
+    fi
+}
+
 usage() {
     cat << EOF
 Claude Multi-Session Orchestrator v${VERSION}
@@ -111,11 +172,12 @@ Commands:
   start <task-id> <prompt>     Start a new Claude session for a task
   run-multi <tasks-json>       Run multiple tasks and wait for completion
   status                       Show status of all sessions
+  list                         List all session task IDs
   result <task-id>             Show result of a specific session
   output <task-id>             Show raw output of a specific session
   stop <task-id>               Stop a running session
   stop-all                     Stop all running sessions
-  clean                        Remove completed session files
+  clean                        Remove completed/stale session files
   version                      Show version information
 
 Options (via environment variables):
@@ -166,6 +228,11 @@ run_multi() {
 
     # Validate JSON before processing
     if ! validate_json "$tasks_json"; then
+        return 1
+    fi
+
+    # Validate task fields
+    if ! validate_tasks "$tasks_json"; then
         return 1
     fi
 
@@ -224,7 +291,7 @@ run_multi() {
             cost=$(jq -r '.total_cost_usd // 0' "$output_file")
             duration=$(jq -r '.duration_ms // 0' "$output_file")
             total_cost=$(echo "$total_cost + $cost" | bc)
-            total_duration=$((total_duration + duration/1000))
+            total_duration=$((total_duration + (duration + 500) / 1000))
         fi
         echo ""
     done < <(echo "$tasks_json" | jq -c '.[]')
@@ -315,7 +382,8 @@ show_result() {
 
         echo "$result"
         echo ""
-        echo -e "${BLUE}Cost: \$${cost} | Duration: $((duration/1000))s${NC}"
+        local duration_sec=$(( (duration + 500) / 1000 ))  # Round to nearest second
+        echo -e "${BLUE}Cost: \$${cost} | Duration: ${duration_sec}s${NC}"
     else
         cat "$output_file"
     fi
@@ -344,7 +412,9 @@ start_session() {
 
     echo -e "${CYAN}Starting session: $task_id${NC}"
     echo -e "${BLUE}Model: $model | Budget: \$$budget${NC}"
-    echo -e "${BLUE}Prompt: ${prompt:0:100}...${NC}"
+    local prompt_display="${prompt:0:100}"
+    [[ ${#prompt} -gt 100 ]] && prompt_display="${prompt_display}..."
+    echo -e "${BLUE}Prompt: ${prompt_display}${NC}"
 
     # Mark as running
     echo "running" > "$status_file"
@@ -546,21 +616,64 @@ stop_all() {
 clean_sessions() {
     echo -e "${CYAN}Cleaning up session files...${NC}"
     local cleaned=0
+    local stale=0
 
     for status_file in "$SESSIONS_DIR"/*.status; do
         [[ ! -f "$status_file" ]] && continue
 
-        local status
+        local task_id status
+        task_id=$(basename "$status_file" .status)
         status=$(cat "$status_file")
+
+        # Check for stale "running" sessions (process died without updating status)
+        if [[ "$status" == "running" ]]; then
+            local pid_file="$SESSIONS_DIR/${task_id}.pid"
+            if [[ -f "$pid_file" ]]; then
+                local pid
+                pid=$(cat "$pid_file")
+                if ! ps -p "$pid" > /dev/null 2>&1; then
+                    # Process is dead - check if stale
+                    local started_file="$SESSIONS_DIR/${task_id}.started"
+                    if [[ -f "$started_file" ]]; then
+                        local started_ts current_ts elapsed
+                        started_ts=$(parse_iso_date "$(cat "$started_file")")
+                        current_ts=$(date +%s)
+                        elapsed=$((current_ts - started_ts))
+
+                        if [[ $elapsed -gt $STALE_THRESHOLD ]]; then
+                            echo -e "${YELLOW}Cleaning stale session: $task_id (dead for ${elapsed}s)${NC}"
+                            rm -f "$SESSIONS_DIR/${task_id}".*
+                            inc stale
+                            continue
+                        fi
+                    fi
+                fi
+            fi
+        fi
+
         if [[ "$status" == "completed" || "$status" == stopped* || "$status" == failed* ]]; then
-            local task_id
-            task_id=$(basename "$status_file" .status)
             rm -f "$SESSIONS_DIR/${task_id}".*
             inc cleaned
         fi
     done
 
-    echo -e "${GREEN}Cleaned $cleaned session(s)${NC}"
+    echo -e "${GREEN}Cleaned $cleaned completed + $stale stale session(s)${NC}"
+}
+
+# List all task IDs
+list_sessions() {
+    echo -e "${CYAN}Session IDs:${NC}"
+    local count=0
+    for status_file in "$SESSIONS_DIR"/*.status; do
+        [[ ! -f "$status_file" ]] && continue
+        local task_id
+        task_id=$(basename "$status_file" .status)
+        echo "  - $task_id"
+        inc count
+    done
+    [[ $count -eq 0 ]] && echo "  (no sessions found)"
+    echo ""
+    echo -e "${BLUE}Total: $count session(s)${NC}"
 }
 
 show_version() {
@@ -587,16 +700,22 @@ case "${1:-}" in
     status)
         show_status
         ;;
+    list)
+        list_sessions
+        ;;
     output)
         shift
+        require_arg "${1:-}" "task-id"
         show_output "$1"
         ;;
     result)
         shift
+        require_arg "${1:-}" "task-id"
         show_result "$1"
         ;;
     stop)
         shift
+        require_arg "${1:-}" "task-id"
         stop_session "$1"
         ;;
     stop-all)
