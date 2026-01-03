@@ -1,0 +1,20 @@
+# Session files (should not be committed)
+*.output
+*.pid
+*.status
+*.started
+*.ended
+orchestrator.log
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Test outputs
+/tmp/
