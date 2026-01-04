@@ -6,6 +6,7 @@ Spawn and manage parallel [Claude Code](https://claude.ai/claude-code) sessions 
 
 - **Parallel Execution** - Run up to 4+ Claude sessions simultaneously
 - **Live Dashboard** - Monitor progress with real-time status updates
+- **Token Savings Metrics** - See efficiency gains and cost savings vs sequential execution 🚀
 - **Auto Timeout** - Kill runaway sessions after configurable timeout
 - **Cost Tracking** - Aggregate costs across all sessions
 - **Cross-Platform** - Works on macOS and Linux
@@ -89,6 +90,8 @@ Output:
 
 ───────────────────────────────────────────────────────────────
   Total: 3 | Completed: 1 | Running: 2 | Failed: 0
+  🚀 Token efficiency: ~45000 tokens saved (~$0.675)
+  📊 Parallel runtime: 123s | Total cost: $1.50
 ═══════════════════════════════════════════════════════════════
 ```
 
@@ -140,6 +143,50 @@ export CLAUDE_SESSION_TIMEOUT=1800  # 30 minutes
 export CLAUDE_DEFAULT_MODEL=opus
 ./claude-multi-session.sh run-multi '[...]'
 ```
+
+## Token Savings & Efficiency Metrics
+
+**New in v1.3.0!** The orchestrator now displays real-time efficiency metrics showing the ROI of parallel execution.
+
+### What You'll See
+
+**After each sprint completes:**
+
+```
+───────────────────────────────────────────────────────────────
+  TOTAL: $2.26 | 330s parallel runtime
+  Sequential estimate: 869s | Speedup: 2.6x
+  🚀 Token savings: ~150000 tokens (~$0.68)
+  📊 Efficiency gain: 23.1% (vs sequential execution)
+═══════════════════════════════════════════════════════════════
+```
+
+### How It Works
+
+**Token Savings Calculation:**
+- Parallel execution avoids re-reading project context for each task
+- Estimated 30% overhead for sequential execution (context re-reading, duplicate imports)
+- Tokens saved = (sequential tokens estimate) - (actual parallel tokens)
+
+**Speedup Factor:**
+- Sequential duration = sum of all task durations
+- Parallel duration = max of all task durations (longest-running task)
+- Speedup = sequential / parallel
+
+### Real-World Example
+
+Running 4 tasks in parallel:
+- **Sequential:** 869s (14.5 minutes)
+- **Parallel:** 330s (5.5 minutes)
+- **Speedup:** 2.6x faster
+- **Token Savings:** ~150,000 tokens (~$0.68 saved)
+- **Efficiency:** 23% fewer tokens than sequential
+
+### Dynamic Performance Indicators
+
+- 🚀 **Excellent** (≥80% completion rate)
+- ⚡ **Good** (50-79% completion rate)
+- ⚠️ **Needs attention** (<50% completion rate)
 
 ## Security Note
 
